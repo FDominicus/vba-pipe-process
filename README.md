@@ -121,9 +121,7 @@ On a non-English Windows this never matches, `exit` is never sent, `cmd` keeps
 waiting for input and the window stays open. This repository checks
 `Len(p2.StdErr) > 0` instead, which works in any language.
 
-The same class of problem is worth remembering generally: **judge a process by
-its exit code, not by the text it prints.** The text is localised; the exit
-code is not.
+
 
 ## Licence
 
