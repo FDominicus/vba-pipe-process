@@ -7,6 +7,7 @@ Attribute VB_GlobalNameSpace = False
 Attribute VB_Creatable = False
 Attribute VB_PredeclaredId = False
 Attribute VB_Exposed = False
+
 Option Compare Database
 Option Explicit
 
@@ -36,14 +37,64 @@ Option Explicit
 ' Fixed: Dim lngResult, lngResult2 As Long declared lngResult as a Variant -
 ' in VBA only the last name in such a list receives the type.
 '
-' NOT changed: GetFileSize is used to poll the pipe. Microsoft does not
-' document that for anonymous pipes; PeekNamedPipe is the supported call.
-' In practice it works, and it is left as the original author wrote it.
-' If a process runs but stdout stays empty, look here first.
-'
 ' NOT changed: the write end of the stdin pipe is never closed. A program
 ' that reads stdin will therefore wait for more input after the StdIn string
 ' has been consumed. Send what ends it - "exit" for cmd - or set a timeout.
+'
+' Cosmetic, left alone to keep the diff readable: PROCESS_INFORMATION.
+' hThStdoutRead is hThread, dwThStdoutReadId is dwThreadId, and
+' CreateProcess takes lpThStdoutReadAttributes where the API says
+' lpThreadAttributes. A global search/replace of "read" in the original
+' caught the middle of "hThread". Also lpCurrentDriectory.
+'
+'------------------------------------------------------------------------------
+' CHANGES 2026-08-28 - measured against the canonical C pattern (KB 190351
+' and the implementations that copy it: git, python subprocess, wine)
+'
+' FIXED - the child process had exactly one environment variable.
+'   The original passed a block containing only SystemRoot. A non-NULL
+'   lpEnvironment REPLACES the environment; the child had no PATH, TEMP,
+'   APPDATA or JAVA_HOME. gpg looks for its keyring under %APPDATA%\gnupg
+'   and would have reported "no key" after a successful import; Java needs
+'   %TEMP%. Now NULL, so the child inherits Access's environment. Use
+'   AddEnvironment to add to it - that path builds the FULL block.
+'
+' FIXED - every failure path leaked handles.
+'   21 x "subSetError n" followed by Exit Sub, none of them closing
+'   anything. One CleanUp label now, reached by success and failure alike;
+'   CloseHandleSafe zeroes each handle so nothing is closed twice.
+'   A failure after CreateProcess also terminates the child instead of
+'   leaving it orphaned with closed pipes.
+'
+' Error codes 8, 9, 10, 11, 13, 14, 15 are no longer raised. Seven API
+' declarations and two locals went with them.
+'
+' FIXED - polling with GetFileSize, and no final read.
+'   GetFileSize is not documented for anonymous pipes; PeekNamedPipe is the
+'   call for this. And the loop only ever read what one tick found, so
+'   whatever a tool wrote between the last tick and its exit was lost - for
+'   a validator that is the verdict itself. PumpPipe now peeks while the
+'   process runs and reads to the end after it stops.
+'
+'   Checked against the Rust standard library (library/std/src/sys):
+'   Rust does not use CreatePipe for stdio at all. Anonymous pipes cannot do
+'   overlapped operations, so it builds a named pipe with a unique name and
+'   FILE_FLAG_OVERLAPPED and waits on both ends with WaitForMultipleObjects.
+'   Cleaner, but it needs pointers that stay valid for the whole operation -
+'   Rust calls that "super unsafe" in its own comment, and in VBA it is not
+'   defensible. Polling is the right answer for an anonymous pipe; only the
+'   call was wrong.
+'
+' NOT an issue here, though it looks like one - handle inheritance.
+'   bInheritHandles is 1 with no handle list, so the child inherits every
+'   inheritable handle this process holds. Rust does not solve that with
+'   PROC_THREAD_ATTRIBUTE_HANDLE_LIST but with a global lock around the
+'   whole spawn (see KB 315939): the race is two threads spawning at once,
+'   where one child inherits the other's pipes. VBA is single-threaded, so
+'   it cannot arise from Access.
+'
+' STILL OPEN:
+'   - CreateProcessA is ANSI: paths outside the system code page will fail.
 '==============================================================================
 
 
@@ -119,21 +170,16 @@ Private Const NORMAL_PRIORITY_CLASS As Long = &H20
 Private Const CREATE_UNICODE_ENVIRONMENT As Long = &H400
 Private Const CREATE_NEW_PROCESS_GROUP As Long = &H200
 
-Private Const CSIDL_WINDOWS         As Long = &H24
-Private Const MAX_PATH              As Long = 260
-Private Const SHGFP_TYPE_CURRENT    As Long = &H0
-Private Const SHGFP_TYPE_DEFAULT    As Long = &H1
-
 Private Const ERROR_NO_DATA         As Long = 232 ' winerror.h
+Private Const DRAIN_BUFFER          As Long = 8192
 
 Private Declare PtrSafe Function CreatePipe Lib "kernel32" (phStdoutReadPipe As LongPtr, phStdoutWritePipe As LongPtr, lpPipeAttributes As SECURITY_ATTRIBUTES, ByVal nSize As Long) As Long
 Private Declare PtrSafe Function SetHandleInformation Lib "kernel32" (ByVal hObject As LongPtr, ByVal dwMask As Long, ByVal dwFlags As Long) As Long
 Private Declare PtrSafe Function DuplicateHandle Lib "kernel32" (ByVal hSourceProcessHandle As LongPtr, ByVal hSourceHandle As LongPtr, ByVal hTargetProcessHandle As LongPtr, lpTargetHandle As LongPtr, ByVal dwDesiredAccess As Long, ByVal bInheritHandle As Long, ByVal dwOptions As Long) As Long
 Private Declare PtrSafe Function CloseHandle Lib "kernel32" (ByVal hObject As LongPtr) As Long
-Private Declare PtrSafe Function GetFileSize Lib "kernel32" (ByVal hFile As LongPtr, lpFileSizeHigh As Long) As Long
+Private Declare PtrSafe Function PeekNamedPipe Lib "kernel32" (ByVal hNamedPipe As LongPtr, lpBuffer As Any, ByVal nBufferSize As Long, lpBytesRead As Long, lpTotalBytesAvail As Long, lpBytesLeftThisMessage As Long) As Long
 Private Declare PtrSafe Function ReadFile Lib "kernel32" (ByVal hFile As LongPtr, lpBuffer As Any, ByVal nNumberOfBytesToRead As Long, lpNumberOfBytesRead As Long, lpOverlapped As Any) As Long
 Private Declare PtrSafe Function WriteFile Lib "kernel32" (ByVal hFile As LongPtr, lpBuffer As Any, ByVal nNumberOfBytesToWrite As Long, lpNumberOfBytesWritten As Long, ByVal lpOverlapped As LongPtr) As Long
-Private Declare PtrSafe Function SHGetFolderPath Lib "shfolder" Alias "SHGetFolderPathA" (ByVal hwndOwner As LongPtr, ByVal nFolder As Long, ByVal hToken As LongPtr, ByVal dwFlags As Long, ByVal pszPath As String) As Long
 Private Declare PtrSafe Sub GetStartupInfo Lib "kernel32" Alias "GetStartupInfoA" (lpStartupInfo As STARTUPINFO)
 Private Declare PtrSafe Function WaitForSingleObject Lib "kernel32" (ByVal hHandle As LongPtr, ByVal dwMilliseconds As Long) As Long
 Private Declare PtrSafe Function CreateProcess Lib "kernel32" Alias "CreateProcessA" (ByVal lpApplicationName As LongPtr, ByVal lpArguments As String, lpProcessAttributes As Any, lpThStdoutReadAttributes As Any, ByVal bInheritHandles As Long, ByVal dwCreationFlags As Long, lpEnvironment As Any, ByVal lpCurrentDriectory As String, lpStartupInfo As STARTUPINFO, lpProcessInformation As PROCESS_INFORMATION) As Long
@@ -165,6 +211,10 @@ Dim lngTickCount As Long
 Dim lngLastOutputTickCount As Long
 
 Dim hProcess As LongPtr   ' used to terminate process in class destructor
+
+' Ergaenzungen zur Umgebung des Kindprozesses. Nothing = erben, siehe
+' AddEnvironment.
+Dim m_Env As Object
 
 ' property getters/setters
 
@@ -364,14 +414,9 @@ Public Sub Execute()
   Dim hStdoutReadTmp As LongPtr, hStderrReadTmp As LongPtr, hStdinWriteTmp As LongPtr
   Dim hStdoutRead As LongPtr, hStderrRead As LongPtr, hStdinRead As LongPtr
   Dim hStdoutWrite As LongPtr, hStderrWrite As LongPtr, hStdinWrite As LongPtr
-  Dim lngReadBytes    As Long
-  Dim abytReadBuf()   As Byte
   Dim strWriteBuf     As String
   Dim lngResult As Long, lngResult2 As Long
   Dim strFullArguments  As String
-  Dim lngSizeOf       As Long
-  Dim strPath         As String
-  Dim strEnv          As String
   Dim abytEnv()       As Byte
   
   If boolIsRunning Then
@@ -387,7 +432,7 @@ Public Sub Execute()
   
   ' input validation
   If (strApplicationName = "") Then subSetError 100, "Missing strApplicationName"
-  If (lngErrNumber <> 0) Then Exit Sub
+  If (lngErrNumber <> 0) Then GoTo CleanUp
   
   ' assign default security descriptor associated with access token of the calling process.
   saPipe.nLength = Len(saPipe)
@@ -407,7 +452,7 @@ Public Sub Execute()
   ' for stdout (and possibly stderr)
   If (CreatePipe(hStdoutReadTmp, hStdoutWrite, saPipe, 0&) = 0&) Then
     subSetError 1, "CreatePipe failes on tmp stdout"
-    Exit Sub
+    GoTo CleanUp
   End If
   
   ' for stderr
@@ -415,21 +460,21 @@ Public Sub Execute()
     ' separate stdout/stderr pipes
     If (CreatePipe(hStderrReadTmp, hStderrWrite, saPipe, 0&) = 0&) Then
       subSetError 2, "CreatePipe failed on tmp stderr"
-      Exit Sub
+      GoTo CleanUp
     End If
   Else
     ' create a duplicate of the stdout handle here for stderr
     ' (in case child decides to close one of them)
     If (DuplicateHandle(GetCurrentProcess(), hStdoutWrite, GetCurrentProcess(), hStderrWrite, 0, True, DUPLICATE_SAME_ACCESS) = 0&) Then
       subSetError 3, "DuplicateHandle failed on stdout/stderr"
-      Exit Sub
+      GoTo CleanUp
     End If
   End If
   
   ' for stdin
   If (CreatePipe(hStdinRead, hStdinWriteTmp, saPipe, 0&) = 0&) Then
     subSetError 4, "CreatePipe failed on tmp stdin"
-    Exit Sub
+    GoTo CleanUp
   End If
   
   ' duplicate handles: get the "real" handles from the tmp handles, with Properties
@@ -437,36 +482,27 @@ Public Sub Execute()
   ' see http://support.microsoft.com/kb/190351
   If (DuplicateHandle(GetCurrentProcess(), hStdoutReadTmp, GetCurrentProcess(), hStdoutRead, 0, False, DUPLICATE_SAME_ACCESS) = 0&) Then
     subSetError 5, "DuplicateHandle failed on stdout"
-    Exit Sub
+    GoTo CleanUp
   End If
   
   If boolSeparateStdoutStderr Then
     If (DuplicateHandle(GetCurrentProcess(), hStderrReadTmp, GetCurrentProcess(), hStderrRead, 0, False, DUPLICATE_SAME_ACCESS) = 0&) Then
       subSetError 6, "DuplicateHandle failed on stderr"
-      Exit Sub
+      GoTo CleanUp
     End If
   End If
   If (DuplicateHandle(GetCurrentProcess(), hStdinWriteTmp, GetCurrentProcess(), hStdinWrite, 0, False, DUPLICATE_SAME_ACCESS) = 0&) Then
     subSetError 7, "DuplicateHandle failed on stdin"
-    Exit Sub
+    GoTo CleanUp
   End If
 
   ' Close inheritable copies of the handles we do not want to be inherited.
-  If (CloseHandle(hStdoutReadTmp) = 0) Then
-    subSetError 8, "CloseHandle failed on tmp stdout"
-    Exit Sub
-  End If
+  CloseHandleSafe hStdoutReadTmp
   ' again, probably don't do this if we're using same handle for stdout/err
   If boolSeparateStdoutStderr Then
-    If (CloseHandle(hStderrReadTmp) = 0) Then
-      subSetError 9, "CloseHandle failed on tmp stderr"
-      Exit Sub
-    End If
+    CloseHandleSafe hStderrReadTmp
   End If
-  If (CloseHandle(hStdinWriteTmp) = 0) Then
-    subSetError 10, "CloseHandle failed on tmp stdin"
-    Exit Sub
-  End If
+  CloseHandleSafe hStdinWriteTmp
   
   tStartupInfo.cb = Len(tStartupInfo)
   GetStartupInfo tStartupInfo
@@ -480,29 +516,35 @@ Public Sub Execute()
   ' full command sent to CreateProcess
   strFullArguments = """" & strApplicationName & """" & " " & strArguments
   
-  ' define SystemRoot environment variable.
-  ' if this isn't here, then TCP network applications will fail with the error
-  '   The requested service provider could not be loaded or initialized.
-  ' because it can't load mswsock.dll (the path to it contains "%SystemRoot" in the protocol section of the winsock registry)
-  ' the other env vars that always seem to be set by CreateProcess (or possibly cmd.exe, which I used for testing) are
-  '   "COMSPEC=C:\WINDOWS\system32\cmd.exe" & Chr(0) & _
-  '   "PATHEXT=.COM;.EXE;.BAT;.CMD;.VBS;.JS;.WS" & Chr(0) & _
-  '   "PROMPT=$P$G" & Chr(0) &
-  strPath = String(MAX_PATH, 0)
-  If (SHGetFolderPath(0, CSIDL_WINDOWS, 0, SHGFP_TYPE_CURRENT, strPath) <> 0) Then
-    subSetError 11, "SHGetFolderPath failed"
-    Exit Sub
+  ' UMGEBUNG DES KINDPROZESSES
+  '
+  ' Das Original uebergab hier einen Block, der NUR SystemRoot enthielt -
+  ' als Abhilfe dafuer, dass TCP-Anwendungen mswsock.dll nicht laden
+  ' konnten. Ein lpEnvironment ungleich NULL ERSETZT die Umgebung aber
+  ' vollstaendig. Der Kindprozess hatte danach kein PATH, kein TEMP, kein
+  ' APPDATA, kein JAVA_HOME.
+  '
+  ' Fuer uns ist das nicht theoretisch: gpg sucht den Schluesselbund unter
+  ' %APPDATA%\gnupg, Java legt Arbeitsdateien unter %TEMP% an. Beides waere
+  ' still ausgefallen - gpg haette gemeldet, es gebe keinen Schluessel.
+  '
+  ' NULL bedeutet: der Kindprozess erbt die Umgebung von Access, samt
+  ' SystemRoot. Das ist der Normalfall in jeder C-Fassung und braucht den
+  ' Umweg des Originals nicht.
+  '
+  ' Nur wenn mit AddEnvironment etwas ergaenzt wurde, bauen wir einen Block -
+  ' dann aber die VOLLSTAENDIGE Umgebung plus die Ergaenzungen.
+  If m_Env Is Nothing Then
+    lngResult = CreateProcess(0&, strFullArguments, saProcess, saThread, 1&, _
+      NORMAL_PRIORITY_CLASS, ByVal 0&, vbNullString, tStartupInfo, tProcessInfo)
+  Else
+    abytEnv = BuildEnvironmentBlock()
+    lngResult = CreateProcess(0&, strFullArguments, saProcess, saThread, 1&, _
+      NORMAL_PRIORITY_CLASS, abytEnv(0), vbNullString, tStartupInfo, tProcessInfo)
   End If
-  strPath = Left(strPath, InStr(1, strPath, Chr(0)) - 1) ' just up to null terminator
-  strEnv = "SystemRoot=" & strPath & Chr(0) & Chr(0)  ' sz terminator + env block terminator
-  abytEnv = StrConv(strEnv, vbFromUnicode)            ' encode as byte array
-    
-  ' if the executable module is a 16-bit application, lpApplicationName should be NULL
-  lngResult = CreateProcess(0&, strFullArguments, saProcess, saThread, 1&, _
-    NORMAL_PRIORITY_CLASS, abytEnv(0), vbNullString, tStartupInfo, tProcessInfo)
   If (lngResult = 0&) Then
     subSetError 12, "CreateProcess failed"
-    Exit Sub
+    GoTo CleanUp
   End If
   
   boolIsRunning = True
@@ -515,24 +557,15 @@ Public Sub Execute()
   ' in this process or else the pipe will not close when the child process exits.
   ' Probably not an issue since we don't use a blocking ReadFile later, but this is consistent
   ' with the microsoft kb article above.
-  If (CloseHandle(hStdoutWrite) = 0) Then
-    subSetError 13, "CloseHandle failed"
-    Exit Sub
-  End If
-  If (CloseHandle(hStdinRead) = 0) Then
-    subSetError 14, "CloseHandle failed"
-    Exit Sub
-  End If
-  If (CloseHandle(hStderrWrite) = 0) Then
-    subSetError 15, "CloseHandle failed"
-    Exit Sub
-  End If
+  CloseHandleSafe hStdoutWrite
+  CloseHandleSafe hStdinRead
+  CloseHandleSafe hStderrWrite
   
 
   ' first first stdin block; TODO: may exceed buffer size ?
   If (WriteFile(hStdinWrite, ByVal strStdIn, Len(strStdIn), lngResult, ByVal 0&) = 0) Then
     subSetError 16, "WriteFile failed"
-    Exit Sub
+    GoTo CleanUp
   End If
   
   ' Debug.Print "wrote " & lngResult & " bytes to stdin; buflen was " & Len(strStdIn)
@@ -547,44 +580,19 @@ Public Sub Execute()
         lngResult = WaitForSingleObject(tProcessInfo.hProcess, lngTickWaitMillis)
       Case &H80, &HFFFFFFFF  ' abandoned / failed
         subSetError 17, "Wait abandoned/failed (" & lngResult & ")"
-        Exit Sub
+        GoTo CleanUp
       Case 0
         ' wait complete
       Case Else
         subSetError 18, "WaitForSingleObject failed (" & lngResult & ")"
         lngExitCode = -5
-        Exit Sub
+        GoTo CleanUp
     End Select
     
-    ' pump the i/o stream pipes
-    lngSizeOf = GetFileSize(hStdoutRead, 0&)
-    If (lngSizeOf > 0) Then
-      ReDim abytReadBuf(lngSizeOf - 1)
-      If ReadFile(hStdoutRead, abytReadBuf(0), UBound(abytReadBuf) + 1, lngReadBytes, ByVal 0&) = 0 Then
-        subSetError 19, "ReadFile failed"
-        Exit Sub
-      Else
-        'Debug.Print "read-stdout: " & StrConv(abytReadBuf, vbUnicode)
-        strStdOut = strStdOut & StrConv(abytReadBuf, vbUnicode)
-        RaiseEvent StdoutAvailable(StrConv(abytReadBuf, vbUnicode))
-        lngLastOutputTickCount = lngTickCount
-      End If
-    End If
-    
+    ' pump the i/o stream pipes - non-blocking, see PumpPipe
+    PumpPipe hStdoutRead, strStdOut, False, False
     If boolSeparateStdoutStderr Then
-      lngSizeOf = GetFileSize(hStderrRead, 0&)
-      If (lngSizeOf > 0) Then
-        ReDim abytReadBuf(lngSizeOf - 1)
-        If ReadFile(hStderrRead, abytReadBuf(0), UBound(abytReadBuf) + 1, lngReadBytes, ByVal 0&) = 0 Then
-          subSetError 20, "Read failed"
-          Exit Sub
-        Else
-          'Debug.Print "read-stderr: " & StrConv(abytReadBuf, vbUnicode)
-          strStdErr = strStdErr & StrConv(abytReadBuf, vbUnicode)
-          RaiseEvent StderrAvailable(StrConv(abytReadBuf, vbUnicode))
-          lngLastOutputTickCount = lngTickCount
-        End If
-      End If
+      PumpPipe hStderrRead, strStdErr, True, False
     End If
     
     ' we send input after reading stdout/stderr since those events probably
@@ -598,7 +606,7 @@ Public Sub Execute()
           lngResult = 0
         Else
           subSetError 21, "WriteFile failed"
-          Exit Sub
+          GoTo CleanUp
         End If
       End If
       lngStdInBufferPos = lngStdInBufferPos + lngResult2
@@ -618,22 +626,209 @@ Public Sub Execute()
     
   Loop Until lngResult = 0
   
+  ' Nachlesen bis zum Ende.
+  '
+  ' Der Durchlauf oben liest nur, was im Augenblick des Ticks dasteht.
+  ' Zwischen dem letzten Tick und dem Prozessende kann noch etwas
+  ' geschrieben worden sein - bei einem Werkzeug, das erst am Schluss sein
+  ' Urteil ausgibt, ist das genau die Zeile, auf die es ankommt.
+  '
+  ' Jetzt ist Blockieren ausgeschlossen: unsere Schreibenden sind seit
+  ' CreateProcess zu, der Kindprozess ist beendet, also ist die Pipe
+  ' gebrochen. ReadFile liefert entweder den Rest oder faellt mit
+  ' ERROR_BROKEN_PIPE zurueck.
+  PumpPipe hStdoutRead, strStdOut, False, True
+  If boolSeparateStdoutStderr Then
+    PumpPipe hStderrRead, strStdErr, True, True
+  End If
+
   Call GetExitCodeProcess(tProcessInfo.hProcess, lngExitCode)
   lngErrNumber = 0
   strErrDescription = ""
   boolIsRunning = False: boolHasRun = True
-  
-  'Debug.Print "============="
-  'Debug.Print "stdout: " & fncRedirectProcess.strStdOut
-  'Debug.Print "stderr: " & fncRedirectProcess.strStdErr
-  
-  ' not too concerned about reporting error conditions from here on
-  CloseHandle tProcessInfo.hThStdoutRead
-  CloseHandle tProcessInfo.hProcess
-  CloseHandle hStdoutRead
-  CloseHandle hStderrRead
-  CloseHandle hStdinWrite
 
+CleanUp:
+  ' EIN Ausgang fuer Erfolg und Fehler.
+  '
+  ' Vorher stand hinter jedem subSetError ein Exit Sub - 21 Stellen, keine
+  ' davon schloss ein Handle. Bei einem Fehlversuch faellt das nicht auf,
+  ' ueber einen Stapellauf schon.
+  '
+  ' Die Reihenfolge ist absichtlich: erst den Prozess, dann die Handles.
+
+  ' Nach einem Abbruch laeuft der Kindprozess sonst verwaist weiter, mit
+  ' geschlossenen Pipes. Auf dem Erfolgsweg ist lngErrNumber 0 und der
+  ' Prozess ohnehin beendet.
+  If lngErrNumber <> 0 And tProcessInfo.hProcess <> 0 Then
+    TerminateProcess tProcessInfo.hProcess, -1
+    boolIsRunning = False
+  End If
+
+  CloseHandleSafe tProcessInfo.hThStdoutRead   ' = hThread, siehe Kopf
+  CloseHandleSafe tProcessInfo.hProcess
+  hProcess = 0
+
+  CloseHandleSafe hStdoutReadTmp
+  CloseHandleSafe hStderrReadTmp
+  CloseHandleSafe hStdinWriteTmp
+  CloseHandleSafe hStdoutWrite
+  CloseHandleSafe hStderrWrite
+  CloseHandleSafe hStdinRead
+  CloseHandleSafe hStdoutRead
+  CloseHandleSafe hStderrRead
+  CloseHandleSafe hStdinWrite
+
+End Sub
+
+
+' Ergaenzt eine Umgebungsvariable fuer den Kindprozess. Ohne Aufruf erbt
+' er die Umgebung von Access unveraendert - das ist der Regelfall.
+'
+' Scripting.Dictionary statt Collection, weil eine VBA-Collection ihre
+' Schluessel nicht herausgibt. Spaet gebunden, damit die Klasse ohne
+' zusaetzlichen Verweis auskommt.
+Public Sub AddEnvironment(sName As String, sValue As String)
+  If boolIsRunning Then
+    Err.Raise 1, "clsPipeProcess", "Cannot set environment while process is running"
+  End If
+  If m_Env Is Nothing Then
+    Set m_Env = CreateObject("Scripting.Dictionary")
+    m_Env.CompareMode = 1                      ' TextCompare: NAME wie name
+  End If
+  m_Env(sName) = sValue
+End Sub
+
+
+Public Sub ClearEnvironment()
+  Set m_Env = Nothing
+End Sub
+
+
+' Vollstaendige Umgebung von Access plus die Ergaenzungen, als ANSI-Block.
+'
+' Environ$(n) liest die Umgebung des eigenen Prozesses und erspart das
+' Hantieren mit GetEnvironmentStrings und Zeigerarithmetik. Namen, die mit
+' "=" beginnen, sind die versteckten Laufwerks-Arbeitsverzeichnisse; die
+' laesst Environ$ ohnehin aus.
+'
+' ANSI ist richtig, weil CreateProcessA benutzt wird und
+' CREATE_UNICODE_ENVIRONMENT nicht gesetzt ist.
+Private Function BuildEnvironmentBlock() As Byte()
+
+  Dim dicAll  As Object
+  Dim i       As Long
+  Dim lngPos  As Long
+  Dim sItem   As String
+  Dim vKey    As Variant
+  Dim sBlock  As String
+
+  Set dicAll = CreateObject("Scripting.Dictionary")
+  dicAll.CompareMode = 1
+
+  i = 1
+  Do
+    sItem = Environ$(i)
+    If Len(sItem) = 0 Then Exit Do
+    lngPos = InStr(sItem, "=")
+    If lngPos > 1 Then
+      dicAll(Left$(sItem, lngPos - 1)) = Mid$(sItem, lngPos + 1)
+    End If
+    i = i + 1
+  Loop
+
+  ' Ergaenzungen ueberschreiben Geerbtes.
+  For Each vKey In m_Env.Keys
+    dicAll(CStr(vKey)) = m_Env(vKey)
+  Next vKey
+
+  For Each vKey In dicAll.Keys
+    sBlock = sBlock & CStr(vKey) & "=" & dicAll(vKey) & Chr$(0)
+  Next vKey
+  sBlock = sBlock & Chr$(0)
+
+  BuildEnvironmentBlock = StrConv(sBlock, vbFromUnicode)
+End Function
+
+
+' Holt, was in der Pipe steht, und legt es an sTarget an.
+'
+' bDrainToEnd = False (waehrend der Laufzeit):
+'   PeekNamedPipe fragt, wieviel bereitliegt, und nur soviel wird gelesen.
+'   Ohne diese Frage wuerde ReadFile blockieren, bis etwas kommt - und die
+'   Schleife stuende still, solange das Werkzeug rechnet.
+'
+'   Die Vorfassung fragte mit GetFileSize. Das ist fuer anonyme Pipes nicht
+'   dokumentiert; PeekNamedPipe ist der vorgesehene Aufruf. Der Grund, dass
+'   ueberhaupt gefragt werden MUSS, ist die anonyme Pipe selbst: sie kann
+'   keine ueberlappenden Operationen. Rusts Standardbibliothek weicht
+'   deshalb auf eine benannte Pipe mit FILE_FLAG_OVERLAPPED aus und wartet
+'   mit WaitForMultipleObjects auf beide Seiten. Das ist der sauberere Weg,
+'   verlangt aber Zeiger, die ueber die ganze Dauer der Operation gueltig
+'   bleiben - in VBA nicht verantwortbar. Umfragen ist fuer diese Bauform
+'   also richtig, nur der Aufruf war falsch.
+'
+' bDrainToEnd = True (nach Prozessende):
+'   Dann ist die Pipe gebrochen und ReadFile kann nicht mehr blockieren.
+'   Gelesen wird, bis nichts mehr kommt - das ist der Abschluss, den jede
+'   C-Fassung hat und der hier fehlte.
+'
+' Fehler beim Lesen brechen den Vorgang NICHT ab. Eine gebrochene Pipe ist
+' der Normalfall am Ende, kein Zwischenfall.
+Private Sub PumpPipe(ByVal hPipe As LongPtr, ByRef sTarget As String, _
+                     ByVal bIsStderr As Boolean, ByVal bDrainToEnd As Boolean)
+
+  Dim lngAvail    As Long
+  Dim lngRead     As Long
+  Dim lngLeft     As Long
+  Dim abytBuf()   As Byte
+  Dim sChunk      As String
+
+  If hPipe = 0 Then Exit Sub
+
+  ' Immer erst fragen, nie ungeprueft lesen. Der erste Entwurf las im
+  ' Nachlese-Zweig direkt - das haengt, wenn ein Enkelprozess das
+  ' Schreibende geerbt hat und die Pipe deshalb NICHT gebrochen ist.
+  Do
+    lngAvail = 0
+    If PeekNamedPipe(hPipe, ByVal 0&, 0&, lngRead, lngAvail, lngLeft) = 0 Then
+      ' Gebrochene Pipe. Waehrend der Laufzeit heisst das: fertig.
+      ' Danach heisst es: es kann noch Gepuffertes drinstehen, das die
+      ' Abfrage nicht mehr meldet. ReadFile kann hier nicht blockieren,
+      ' eine gebrochene Pipe antwortet sofort - entweder mit dem Rest oder
+      ' mit null Bytes. Die Schleife endet dann von selbst.
+      If Not bDrainToEnd Then Exit Do
+      lngAvail = DRAIN_BUFFER
+    ElseIf lngAvail <= 0 Then
+      Exit Do
+    End If
+
+    ReDim abytBuf(lngAvail - 1)
+    lngRead = 0
+    If ReadFile(hPipe, abytBuf(0), lngAvail, lngRead, ByVal 0&) = 0 Then Exit Do
+    If lngRead <= 0 Then Exit Do
+    If lngRead < lngAvail Then ReDim Preserve abytBuf(lngRead - 1)
+
+    sChunk = StrConv(abytBuf, vbUnicode)
+    sTarget = sTarget & sChunk
+    If bIsStderr Then
+      RaiseEvent StderrAvailable(sChunk)
+    Else
+      RaiseEvent StdoutAvailable(sChunk)
+    End If
+    lngLastOutputTickCount = lngTickCount
+  Loop
+End Sub
+
+
+' Schliesst ein Handle nur, wenn es offen ist, und setzt es auf 0.
+' Das Nullen ist der Punkt: ein zweites CloseHandle auf denselben Wert
+' schliesst irgendwann ein fremdes Handle, das die Nummer inzwischen
+' wiederbekommen hat. Deshalb ByRef.
+Private Sub CloseHandleSafe(ByRef h As LongPtr)
+  If h <> 0 Then
+    CloseHandle h
+    h = 0
+  End If
 End Sub
 
 
@@ -642,6 +837,8 @@ Private Sub subSetError(errNumber As Long, errDescription As String)
   strErrDescription = errDescription & " (" & Err.LastDllError & ")"
   boolIsRunning = False: boolHasRun = True
 End Sub
+
+
 
 
 
